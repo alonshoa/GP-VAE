@@ -3,7 +3,6 @@
 TensorFlow models for use in this project.
 
 """
-
 from .utils import *
 from .nn_utils import *
 from .gp_kernel import *
@@ -14,7 +13,7 @@ import tensorflow as tf
 # Encoders
 
 class DiagonalEncoder(tf.keras.Model):
-    def __init__(self, z_size, hidden_sizes=(64, 64), **kwargs):
+    def __init__(self, z_size, hidden_sizes=(64, 64), use_mixer=False, **kwargs):
         """ Encoder with factorized Normal posterior over temporal dimension
             Used by disjoint VAE and HI-VAE with Standard Normal prior
             :param z_size: latent space dimensionality
@@ -23,7 +22,10 @@ class DiagonalEncoder(tf.keras.Model):
         """
         super(DiagonalEncoder, self).__init__()
         self.z_size = int(z_size)
-        self.net = make_nn(2*z_size, hidden_sizes)
+        if use_mixer:
+            self.net = make_mixer_nn2(2*z_size, hidden_sizes)
+        else:
+            self.net = make_nn(2 * z_size, hidden_sizes)
 
     def __call__(self, x):
         mapped = self.net(x)
@@ -33,7 +35,7 @@ class DiagonalEncoder(tf.keras.Model):
 
 
 class JointEncoder(tf.keras.Model):
-    def __init__(self, z_size, hidden_sizes=(64, 64), window_size=3, transpose=False, **kwargs):
+    def __init__(self, z_size, hidden_sizes=(64, 64), window_size=3, transpose=False, use_mixer=False, **kwargs):
         """ Encoder with 1d-convolutional network and factorized Normal posterior
             Used by joint VAE and HI-VAE with Standard Normal prior or GP-VAE with factorized Normal posterior
             :param z_size: latent space dimensionality
@@ -44,7 +46,10 @@ class JointEncoder(tf.keras.Model):
         """
         super(JointEncoder, self).__init__()
         self.z_size = int(z_size)
-        self.net = make_cnn(2*z_size, hidden_sizes, window_size)
+        if use_mixer:
+            self.net = make_mixer_nn2(2*z_size, hidden_sizes,4)
+        else:
+            self.net = make_cnn(2*z_size, hidden_sizes, window_size)
         self.transpose = transpose
 
     def __call__(self, x):
@@ -62,7 +67,7 @@ class JointEncoder(tf.keras.Model):
 
 
 class BandedJointEncoder(tf.keras.Model):
-    def __init__(self, z_size, hidden_sizes=(64, 64), window_size=3, data_type=None, **kwargs):
+    def __init__(self, z_size, hidden_sizes=(64, 64), window_size=3, data_type=None,use_mixer=False, **kwargs):
         """ Encoder with 1d-convolutional network and multivariate Normal posterior
             Used by GP-VAE with proposed banded covariance matrix
             :param z_size: latent space dimensionality
@@ -75,11 +80,17 @@ class BandedJointEncoder(tf.keras.Model):
         """
         super(BandedJointEncoder, self).__init__()
         self.z_size = int(z_size)
-        self.net = make_cnn(3*z_size, hidden_sizes, window_size)
+        if use_mixer:
+            self.net = make_mixer_nn2(hidden_sizes,4,out_shape=(3 * z_size,))
+        else:
+            self.net = make_cnn(3*z_size, hidden_sizes, window_size)
+
         self.data_type = data_type
 
     def __call__(self, x):
-        mapped = self.net(x)
+
+        normalize = tf.keras.utils.normalize(x)
+        mapped = self.net(normalize)
 
         batch_size = mapped.shape.as_list()[0]
         time_length = mapped.shape.as_list()[1]
@@ -92,7 +103,7 @@ class BandedJointEncoder(tf.keras.Model):
         mapped_covar = mapped_transposed[:, self.z_size:]
 
         # tf.nn.sigmoid provides more stable performance on Physionet dataset
-        if self.data_type == 'physionet':
+        if self.data_type in ['physionet']:
             mapped_covar = tf.nn.sigmoid(mapped_covar)
         else:
             mapped_covar = tf.nn.softplus(mapped_covar)
@@ -128,14 +139,17 @@ class BandedJointEncoder(tf.keras.Model):
 # Decoders
 
 class Decoder(tf.keras.Model):
-    def __init__(self, output_size, hidden_sizes=(64, 64)):
+    def __init__(self, output_size, hidden_sizes=(64, 64), use_mixer=False, image_size=(110, 3)):
         """ Decoder parent class with no specified output distribution
             :param output_size: output dimensionality
             :param hidden_sizes: tuple of hidden layer sizes.
                                  The tuple length sets the number of hidden layers.
         """
         super(Decoder, self).__init__()
-        self.net = make_nn(output_size, hidden_sizes)
+        if use_mixer:
+            self.net = make_mixer_nn2( (16,128),4,out_shape=[image_size[0]*16,3])
+        else:
+            self.net = make_nn(output_size, hidden_sizes)
 
     def __call__(self, x):
         pass
@@ -149,8 +163,12 @@ class BernoulliDecoder(Decoder):
 
 
 class GaussianDecoder(Decoder):
+    def __init__(self,*args,**kwargs):
+        super(GaussianDecoder, self).__init__(*args,**kwargs)
+        self.count=0
     """ Decoder with Gaussian output distribution (used for SPRITES and Physionet) """
     def __call__(self, x):
+        self.count += 1
         mean = self.net(x)
         var = tf.ones(tf.shape(input=mean), dtype=tf.float32)
         return tfd.Normal(loc=mean, scale=var)
@@ -173,6 +191,16 @@ class ImagePreprocessor(tf.keras.Model):
     def __call__(self, x):
         return self.net(x)
 
+class MotionPreprocessor(tf.keras.Model):
+    def __init__(self, motion_shape, hidden_sizes=None, kernel_size=3.):
+        """ motion capture preprocess
+        """
+        super(MotionPreprocessor, self).__init__()
+        self.image_shape = motion_shape
+        self.net = make_mixer_nn2( motion_shape, kernel_size)
+
+    def __call__(self, x):
+        return self.net(x)
 
 # VAE models
 
@@ -180,7 +208,7 @@ class VAE(tf.keras.Model):
     def __init__(self, latent_dim, data_dim, time_length,
                  encoder_sizes=(64, 64), encoder=DiagonalEncoder,
                  decoder_sizes=(64, 64), decoder=BernoulliDecoder,
-                 image_preprocessor=None, beta=1.0, M=1, K=1, **kwargs):
+                 image_preprocessor=None, beta=1.0, M=1, K=1, use_mixer=False, **kwargs):
         """ Basic Variational Autoencoder with Standard Normal prior
             :param latent_dim: latent space dimensionality
             :param data_dim: original data dimensionality
@@ -201,8 +229,8 @@ class VAE(tf.keras.Model):
         self.data_dim = data_dim
         self.time_length = time_length
 
-        self.encoder = encoder(latent_dim, encoder_sizes, **kwargs)
-        self.decoder = decoder(data_dim, decoder_sizes)
+        self.encoder = encoder(latent_dim, encoder_sizes, use_mixer=use_mixer, **kwargs)
+        self.decoder = decoder(data_dim, decoder_sizes, use_mixer=use_mixer)
         self.preprocessor = image_preprocessor
 
         self.beta = beta
@@ -267,7 +295,7 @@ class VAE(tf.keras.Model):
         return tf.reduce_sum(input_tensor=mse)
 
     def _compute_loss(self, x, m_mask=None, return_parts=False):
-        assert len(x.shape) == 3, "Input should have shape: [batch_size, time_length, data_dim]"
+        assert len(x.shape) == 3, f"Input should have shape: [batch_size, time_length, data_dim] but got {x.shape}"
         x = tf.identity(x)  # in case x is not a Tensor already...
         x = tf.tile(x, [self.M * self.K, 1, 1])  # shape=(M*K*BS, TL, D)
 
@@ -281,11 +309,19 @@ class VAE(tf.keras.Model):
         z = qz_x.sample()
         px_z = self.decode(z)
 
+        x_hat = px_z.sample()
+
+        mse_loss = tf.math.squared_difference(x_hat, x)
+        mse_loss = tf.reduce_sum(input_tensor=mse_loss.mean(axis=[0,1]))
+
         nll = -px_z.log_prob(x)  # shape=(M*K*BS, TL, D)
+
         nll = tf.compat.v1.where(tf.math.is_finite(nll), nll, tf.zeros_like(nll))
         if m_mask is not None:
             nll = tf.compat.v1.where(m_mask, tf.zeros_like(nll), nll)  # if not HI-VAE, m_mask is always zeros
         nll = tf.reduce_sum(input_tensor=nll, axis=[1, 2])  # shape=(M*K*BS)
+
+
 
         if self.K > 1:
             kl = qz_x.log_prob(z) - pz.log_prob(z)  # shape=(M*K*BS, TL or d)
@@ -303,13 +339,13 @@ class VAE(tf.keras.Model):
             kl = tf.compat.v1.where(tf.math.is_finite(kl), kl, tf.zeros_like(kl))
             kl = tf.reduce_sum(input_tensor=kl, axis=1)  # shape=(M*K*BS)
 
-            elbo = -nll - self.beta * kl  # shape=(M*K*BS) K=1
+            elbo = -nll - self.beta * kl - self.beta * mse_loss # shape=(M*K*BS) K=1
             elbo = tf.reduce_mean(input_tensor=elbo)  # scalar
 
         if return_parts:
             nll = tf.reduce_mean(input_tensor=nll)  # scalar
             kl = tf.reduce_mean(input_tensor=kl)  # scalar
-            return -elbo, nll, kl
+            return -elbo, nll, kl,mse_loss
         else:
             return -elbo
 
@@ -437,3 +473,4 @@ class GP_VAE(HI_VAE):
                       squared_frobenius_norm(b_inv_a) + squared_frobenius_norm(
                       b.scale.solve((b.mean() - a.mean())[..., tf.newaxis]))))
         return kl_div
+
